@@ -1,8 +1,9 @@
 import {
   $, component$, useComputed$, useSignal, useStore, useVisibleTask$
 } from '@builder.io/qwik';
-import { Checkbox, Modal, Tabs } from '@qwik-ui/headless';
-import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup } from './types';
+import { Modal, Tabs } from '@qwik-ui/headless';
+import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup, UserRejectReason } from './types';
+import { REJECT_REASON_OPTIONS, rejectReasonLabel } from './types';
 import { computeMatches, fieldValue, scorePair } from './utils/matching';
 import { seedState } from './data/seed';
 
@@ -24,6 +25,17 @@ const matchLabel = (state: ArchiveState, match: MatchCandidate) => {
   const right = recordById(state, match.rightId);
   return `${left?.title ?? '未知记录'} ↔ ${right?.title ?? '未知记录'}`;
 };
+const matchLabelById = (state: ArchiveState, id: string) => {
+  const match = state.matches.find((item) => item.id === id);
+  if (match && match.status !== 'merged') return matchLabel(state, match);
+  const merge = state.merges.find((item) => item.matchId === id);
+  if (merge) return `合并记录「${merge.values.title ?? '未知记录'}」`;
+  return match ? matchLabel(state, match) : id;
+};
+const sharesRecord = (a: MatchCandidate, b: MatchCandidate) =>
+  a.leftId === b.leftId || a.leftId === b.rightId || a.rightId === b.leftId || a.rightId === b.rightId;
+const confirmedConflictsFor = (state: ArchiveState, match: MatchCandidate) =>
+  state.matches.filter((item) => item.id !== match.id && item.status === 'confirmed' && sharesRecord(item, match));
 
 export default component$(() => {
   const state = useStore<ArchiveState>(seedState());
@@ -41,6 +53,8 @@ export default component$(() => {
   const importText = useSignal('');
   const toast = useSignal('');
   const panelTab = useSignal(0);
+  const rejectReason = useSignal<UserRejectReason | ''>('');
+  const rejectHint = useSignal('');
 
   const snapshot = () => JSON.stringify({
     revision: state.revision,
@@ -106,35 +120,127 @@ export default component$(() => {
 
   const visibleMatches = useComputed$(() => filteredMatches.value.slice(0, 120));
   const activeMatch = useComputed$(() => state.matches.find((match) => match.id === state.activeMatchId) ?? filteredMatches.value[0]);
+  const activeConflicts = useComputed$(() => {
+    const match = activeMatch.value;
+    if (!match || match.status === 'merged') return [] as MatchCandidate[];
+    return confirmedConflictsFor(state, match);
+  });
   const conflictCount = useComputed$(() => state.matches.filter((match) => match.status === 'suggested' && match.score < .68).length);
 
-  const updateMatch = $((id: string, status: MatchCandidate['status']) => {
-    capture();
+  const applyConfirm = (match: MatchCandidate) => {
+    const now = new Date().toISOString();
+    const displaced = confirmedConflictsFor(state, match);
+    displaced.forEach((item) => {
+      item.status = 'rejected';
+      item.rejectReason = 'superseded';
+      item.supersededBy = match.id;
+      item.reviewedAt = now;
+    });
+    match.status = 'confirmed';
+    match.reviewedAt = now;
+    state.records.forEach((record) => {
+      if (record.id === match.leftId || record.id === match.rightId) record.status = 'confirmed';
+    });
+    displaced.forEach((item) => {
+      [item.leftId, item.rightId].forEach((recordId) => {
+        const record = recordById(state, recordId);
+        if (!record || record.status !== 'confirmed') return;
+        const stillConfirmed = state.matches.some((other) => other.status === 'confirmed' && (other.leftId === recordId || other.rightId === recordId));
+        if (!stillConfirmed) record.status = 'unreviewed';
+      });
+    });
+    return displaced;
+  };
+
+  const confirmMatch = $((id: string) => {
     const match = state.matches.find((item) => item.id === id);
     if (!match) return;
-    match.status = status;
-    match.reviewedAt = new Date().toISOString();
-    state.records.forEach((record) => {
-      if ((record.id === match.leftId || record.id === match.rightId) && status === 'confirmed') record.status = 'confirmed';
-    });
-    commit(status === 'confirmed' ? '确认匹配' : '忽略可疑匹配', matchLabel(state, match), [match.leftId, match.rightId]);
-    notify(status === 'confirmed' ? '已确认此项匹配' : '已忽略此项匹配');
+    const conflicts = confirmedConflictsFor(state, match);
+    if (conflicts.length) {
+      const list = conflicts.map((item) => `· ${matchLabel(state, item)}（${Math.round(item.score * 100)}%）`).join('\n');
+      const ok = window.confirm(`记录已进入已确认匹配。继续确认将挤掉以下 ${conflicts.length} 条匹配：\n${list}\n\n被挤掉的匹配会标记为已忽略，原因记为「被新确认匹配挤掉」。是否继续？`);
+      if (!ok) { notify('已取消确认，未改动任何匹配'); return; }
+    }
+    capture();
+    const displaced = applyConfirm(match);
+    const suffix = displaced.length ? `；挤掉已确认匹配：${displaced.map((item) => matchLabel(state, item)).join('、')}` : '';
+    commit('确认匹配', `${matchLabel(state, match)}${suffix}`, [match.leftId, match.rightId, ...displaced.flatMap((item) => [item.leftId, item.rightId])]);
+    notify(displaced.length ? `已确认此项匹配，并挤掉 ${displaced.length} 条已确认匹配` : '已确认此项匹配');
   });
 
-  const bulkMatch = $((status: MatchCandidate['status']) => {
+  const rejectMatch = $((id: string) => {
+    const match = state.matches.find((item) => item.id === id);
+    if (!match) return;
+    if (!rejectReason.value) {
+      rejectHint.value = '缺少忽略原因：请从固定原因中选择一项后再忽略';
+      notify('已拦下忽略操作：尚未选择固定原因');
+      return;
+    }
+    capture();
+    const label = rejectReasonLabel(rejectReason.value);
+    match.status = 'rejected';
+    match.rejectReason = rejectReason.value;
+    match.reviewedAt = new Date().toISOString();
+    rejectHint.value = '';
+    commit('忽略可疑匹配', `${matchLabel(state, match)} —— 原因：${label}`, [match.leftId, match.rightId]);
+    notify(`已忽略此项匹配（${label}）`);
+  });
+
+  const bulkMatch = $((status: 'confirmed' | 'rejected') => {
     const ids = selectedMatchIds.value;
     if (!ids.length) return;
+    if (status === 'rejected' && !rejectReason.value) {
+      rejectHint.value = '缺少忽略原因：批量忽略前请从固定原因中选择一项';
+      notify('已拦下批量忽略：尚未选择固定原因');
+      return;
+    }
+    if (status === 'confirmed') {
+      const confirmedIds = new Set(state.matches.filter((item) => item.status === 'confirmed').map((item) => item.id));
+      const displacedPreview = new Map<string, MatchCandidate>();
+      ids.forEach((id) => {
+        const match = state.matches.find((item) => item.id === id);
+        if (!match) return;
+        state.matches.forEach((item) => {
+          if (item.id !== id && confirmedIds.has(item.id) && sharesRecord(item, match)) {
+            confirmedIds.delete(item.id);
+            displacedPreview.set(item.id, item);
+          }
+        });
+        confirmedIds.add(id);
+      });
+      if (displacedPreview.size) {
+        const items = [...displacedPreview.values()];
+        const list = items.slice(0, 6).map((item) => `· ${matchLabel(state, item)}`).join('\n');
+        const more = items.length > 6 ? `\n… 以及另外 ${items.length - 6} 条` : '';
+        const ok = window.confirm(`批量确认将挤掉以下 ${items.length} 条已确认匹配：\n${list}${more}\n\n被挤掉的匹配会标记为已忽略，原因记为「被新确认匹配挤掉」。是否继续？`);
+        if (!ok) { notify('已取消批量确认，未改动任何匹配'); return; }
+      }
+    }
     capture();
+    const now = new Date().toISOString();
+    const reason = rejectReason.value as UserRejectReason;
+    const displacedAll: MatchCandidate[] = [];
     ids.forEach((id) => {
       const match = state.matches.find((item) => item.id === id);
       if (!match) return;
-      match.status = status;
-      match.reviewedAt = new Date().toISOString();
+      if (status === 'confirmed') displacedAll.push(...applyConfirm(match));
+      else {
+        match.status = 'rejected';
+        match.rejectReason = reason;
+        match.reviewedAt = now;
+      }
     });
-    commit('批量复核', `${ids.length} 条匹配被标记为${status === 'confirmed' ? '确认' : '忽略'}`, ids.flatMap((id) => {
+    const recordIds = ids.flatMap((id) => {
       const match = state.matches.find((item) => item.id === id);
       return match ? [match.leftId, match.rightId] : [];
-    }));
+    });
+    if (status === 'confirmed') {
+      const suffix = displacedAll.length ? `；挤掉 ${displacedAll.length} 条已确认匹配：${displacedAll.map((item) => matchLabel(state, item)).join('、')}` : '';
+      commit('批量复核', `${ids.length} 条匹配被标记为确认${suffix}`, [...recordIds, ...displacedAll.flatMap((item) => [item.leftId, item.rightId])]);
+    } else {
+      commit('批量复核', `${ids.length} 条匹配被标记为忽略（原因：${rejectReasonLabel(reason)}）`, recordIds);
+    }
+    rejectHint.value = '';
     selectedMatchIds.value = [];
     notify(`已批量处理 ${ids.length} 条匹配`);
   });
@@ -178,9 +284,18 @@ export default component$(() => {
       updatedAt: new Date().toISOString()
     };
     state.records = [...state.records.filter((record) => record.id !== left.id && record.id !== right.id), merged];
+    const now = new Date().toISOString();
+    const autoIgnored = state.matches.filter((item) =>
+      item.id !== match.id && item.status !== 'rejected' &&
+      (item.leftId === left.id || item.rightId === right.id || item.leftId === right.id || item.rightId === left.id));
+    autoIgnored.forEach((item) => {
+      item.status = 'rejected';
+      item.rejectReason = 'records-merged';
+      item.supersededBy = match.id;
+      item.reviewedAt = now;
+    });
     state.matches.forEach((item) => {
       if (item.id === match.id) item.status = 'merged';
-      else if (item.leftId === left.id || item.rightId === right.id || item.leftId === right.id || item.rightId === left.id) item.status = 'rejected';
     });
     state.merges.unshift({
       id: crypto.randomUUID(),
@@ -191,7 +306,7 @@ export default component$(() => {
       values,
       mergedAt: new Date().toISOString()
     });
-    commit('合并两条记录', `保留 ${Object.values(choices).filter((choice) => choice === 'A').length} 个 A 来源字段、${Object.values(choices).filter((choice) => choice === 'B').length} 个 B 来源字段`, [left.id, right.id, merged.id]);
+    commit('合并两条记录', `保留 ${Object.values(choices).filter((choice) => choice === 'A').length} 个 A 来源字段、${Object.values(choices).filter((choice) => choice === 'B').length} 个 B 来源字段${autoIgnored.length ? `；${autoIgnored.length} 条相关匹配自动忽略（关联记录已合并）` : ''}`, [left.id, right.id, merged.id]);
     mergeOpen.value = false;
     notify('记录已合并，来源与字段选择已写入审计记录');
   });
@@ -312,8 +427,8 @@ export default component$(() => {
       if (key === 'j') { event.preventDefault(); moveReview(1); }
       if (key === 'k') { event.preventDefault(); moveReview(-1); }
       if (event.key === 'Enter' && activeMatch.value) { event.preventDefault(); openMerge(); }
-      if (key === 'c' && activeMatch.value) { event.preventDefault(); updateMatch(activeMatch.value.id, 'confirmed'); }
-      if (key === 'r' && activeMatch.value) { event.preventDefault(); updateMatch(activeMatch.value.id, 'rejected'); }
+      if (key === 'c' && activeMatch.value) { event.preventDefault(); confirmMatch(activeMatch.value.id); }
+      if (key === 'r' && activeMatch.value) { event.preventDefault(); rejectMatch(activeMatch.value.id); }
       if (key === '?' || (event.shiftKey && event.key === '/')) { event.preventDefault(); panelTab.value = 2; }
     };
     window.addEventListener('keydown', handler);
@@ -357,7 +472,17 @@ export default component$(() => {
               <option value="all">全部匹配</option><option value="suggested">待复核</option><option value="confirmed">已确认</option><option value="rejected">已忽略</option>
             </select>
             <button class="button small" disabled={!selectedMatchIds.value.length} onClick$={() => bulkMatch('confirmed')}>批量确认</button>
+            <select
+              class={`input reason-select ${rejectHint.value ? 'missing' : ''}`}
+              aria-label="批量忽略原因"
+              value={rejectReason.value}
+              onChange$={(event) => { rejectReason.value = (event.target as HTMLSelectElement).value as UserRejectReason | ''; rejectHint.value = ''; }}
+            >
+              <option value="">忽略原因（必选）…</option>
+              {REJECT_REASON_OPTIONS.map((option) => <option value={option.id} key={option.id}>{option.label}</option>)}
+            </select>
             <button class="button small ghost" disabled={!selectedMatchIds.value.length} onClick$={() => bulkMatch('rejected')}>批量忽略</button>
+            {rejectHint.value && <span class="field-error">{rejectHint.value}</span>}
           </div>
           <div class="match-list">
             {visibleMatches.value.map((match) => {
@@ -372,17 +497,19 @@ export default component$(() => {
                   tabIndex={0}
                 >
                   <div class="match-topline">
-                    <Checkbox.Root
+                    <button
+                      type="button"
                       class="qwik-check"
+                      role="checkbox"
+                      aria-checked={selectedMatchIds.value.includes(match.id)}
                       aria-label={`选择匹配 ${match.id}`}
-                      initialValue={selectedMatchIds.value.includes(match.id)}
                       onClick$={(event: Event) => {
                         event.stopPropagation();
                         selectedMatchIds.value = selectedMatchIds.value.includes(match.id)
                           ? selectedMatchIds.value.filter((id) => id !== match.id)
                           : [...selectedMatchIds.value, match.id];
                       }}
-                    ><Checkbox.Indicator>✓</Checkbox.Indicator></Checkbox.Root>
+                    >{selectedMatchIds.value.includes(match.id) ? '✓' : ''}</button>
                     <span class={`score ${match.score < .68 ? 'low' : ''}`}>{Math.round(match.score * 100)}%</span>
                     <span class={`status ${match.status}`}>{match.status === 'suggested' ? '待复核' : match.status === 'confirmed' ? '已确认' : match.status === 'rejected' ? '已忽略' : '已合并'}</span>
                     <span class="record-id">{left?.identifier}</span>
@@ -393,6 +520,12 @@ export default component$(() => {
                     <div><small>B · {right?.group}</small><strong>{right?.title}</strong><span>{parseDate(right?.date ?? '')} · {right?.people.join('、')}</span></div>
                   </div>
                   <div class="reason-line">{match.reasons.join(' · ')}</div>
+                  {match.status === 'rejected' && (
+                    <div class="reject-line">
+                      {match.rejectReason ? `忽略原因：${rejectReasonLabel(match.rejectReason)}` : '已忽略（旧进度未记录原因）'}
+                      {match.supersededBy && ` · 被「${matchLabelById(state, match.supersededBy)}」挤掉`}
+                    </div>
+                  )}
                 </article>
               );
             })}
@@ -435,10 +568,35 @@ export default component$(() => {
                 const right = recordById(state, activeMatch.value!.rightId)!;
                 return <>
                   <div class="active-score"><span>{Math.round(activeMatch.value!.score * 100)}</span><div><strong>综合匹配分</strong><small>{activeMatch.value!.reasons.join(' · ')}</small></div></div>
+                  {activeMatch.value!.status === 'rejected' && (
+                    <div class="reject-line detail">
+                      {activeMatch.value!.rejectReason ? `忽略原因：${rejectReasonLabel(activeMatch.value!.rejectReason)}` : '已忽略（旧进度未记录原因）'}
+                      {activeMatch.value!.supersededBy && ` · 被「${matchLabelById(state, activeMatch.value!.supersededBy!)}」挤掉`}
+                    </div>
+                  )}
                   <div class="field-compare compact"><div class="field-label">字段</div><div>A 来源</div><div>B 来源</div>
                     {fieldLabels.map(([field, label]) => <><div class="field-label">{label}</div><div class={fieldValue(left, field) !== fieldValue(right, field) ? 'different' : ''}>{fieldValue(left, field) || '—'}</div><div class={fieldValue(left, field) !== fieldValue(right, field) ? 'different' : ''}>{fieldValue(right, field) || '—'}</div></>)}
                   </div>
-                  <div class="action-stack"><button class="button primary wide" onClick$={openMerge}>逐字段合并</button><div class="split-actions"><button class="button confirm" onClick$={() => updateMatch(activeMatch.value!.id, 'confirmed')}>确认匹配</button><button class="button ghost" onClick$={() => updateMatch(activeMatch.value!.id, 'rejected')}>忽略</button></div></div>
+                  <div class="action-stack">
+                    <button class="button primary wide" onClick$={openMerge}>逐字段合并</button>
+                    {activeConflicts.value.length > 0 && (
+                      <div class="displace-warning">
+                        <strong>确认此匹配将挤掉 {activeConflicts.value.length} 条已确认匹配：</strong>
+                        <ul>{activeConflicts.value.map((item) => <li key={item.id}>{matchLabel(state, item)}（{Math.round(item.score * 100)}%）</li>)}</ul>
+                      </div>
+                    )}
+                    <div class="split-actions"><button class="button confirm" onClick$={() => confirmMatch(activeMatch.value!.id)}>确认匹配</button><button class="button ghost" onClick$={() => rejectMatch(activeMatch.value!.id)}>忽略</button></div>
+                    <select
+                      class={`input reason-select ${rejectHint.value ? 'missing' : ''}`}
+                      aria-label="忽略原因"
+                      value={rejectReason.value}
+                      onChange$={(event) => { rejectReason.value = (event.target as HTMLSelectElement).value as UserRejectReason | ''; rejectHint.value = ''; }}
+                    >
+                      <option value="">忽略原因（固定选项，必选）…</option>
+                      {REJECT_REASON_OPTIONS.map((option) => <option value={option.id} key={option.id}>{option.label}</option>)}
+                    </select>
+                    {rejectHint.value && <p class="field-error">{rejectHint.value}</p>}
+                  </div>
                 </>;
               })() : <div class="empty-state">从左侧选择一条匹配查看字段来源。</div>}
             </Tabs.Panel>
@@ -450,7 +608,7 @@ export default component$(() => {
               }) : <div class="empty-state">还没有合并记录。完成一次字段合并后，来源选择会出现在这里。</div>}
             </Tabs.Panel>
             <Tabs.Panel class="tab-panel shortcut-panel">
-              <div><kbd>J / K</kbd><span>下一条 / 上一条可疑匹配</span></div><div><kbd>Enter</kbd><span>打开逐字段合并窗口</span></div><div><kbd>C / R</kbd><span>确认 / 忽略当前匹配</span></div><div><kbd>Ctrl + Z / Y</kbd><span>撤销 / 重做</span></div><div><kbd>Ctrl + I</kbd><span>打开导入窗口</span></div><div><kbd>Ctrl/⌘ + Enter</kbd><span>在导入框中提交记录</span></div>
+              <div><kbd>J / K</kbd><span>下一条 / 上一条可疑匹配</span></div><div><kbd>Enter</kbd><span>打开逐字段合并窗口</span></div><div><kbd>C / R</kbd><span>确认 / 忽略当前匹配（忽略需先选固定原因）</span></div><div><kbd>Ctrl + Z / Y</kbd><span>撤销 / 重做</span></div><div><kbd>Ctrl + I</kbd><span>打开导入窗口</span></div><div><kbd>Ctrl/⌘ + Enter</kbd><span>在导入框中提交记录</span></div>
             </Tabs.Panel>
           </Tabs.Root>
         </section>
@@ -467,7 +625,7 @@ export default component$(() => {
           <div class="panel-heading"><div><span class="eyebrow">METHOD</span><h3>匹配与保护规则</h3></div></div>
           <p>标题、日期、人物、地点和编号按权重综合评分。低于 68% 的候选会以红色标记，但系统不会替研究者自动决定。</p>
           <div class="rule-row"><span>1</span><p>每个字段保留 A / B 来源，可在合并窗口中单独选择或拼接。</p></div>
-          <div class="rule-row"><span>2</span><p>原始记录、合并结果和忽略理由都进入本地审计轨迹。</p></div>
+          <div class="rule-row"><span>2</span><p>忽略必须从固定原因中挑选一项；原始记录、合并结果、忽略原因和挤掉关系都进入本地审计轨迹。</p></div>
           <div class="rule-row"><span>3</span><p>记录列表使用分批窗口渲染，导入大量数据时仍只挂载当前窗口。</p></div>
         </article>
       </section>
@@ -495,8 +653,17 @@ export default component$(() => {
           {activeMatch.value && (() => {
             const left = recordById(state, activeMatch.value!.leftId)!;
             const right = recordById(state, activeMatch.value!.rightId)!;
+            const mergeAffected = state.matches.filter((item) =>
+              item.id !== activeMatch.value!.id && item.status === 'confirmed' &&
+              (item.leftId === left.id || item.rightId === left.id || item.leftId === right.id || item.rightId === right.id));
             return <>
               <Modal.Description class="modal-description">每个字段都显示两条记录的原始来源。选择后，生成一条新合并记录，原记录编号与选择依据仍保留在审计轨迹中。</Modal.Description>
+              {mergeAffected.length > 0 && (
+                <div class="displace-warning modal-warning">
+                  <strong>合并后，以下 {mergeAffected.length} 条已确认匹配将被标记为已忽略（原因：关联记录已合并）：</strong>
+                  <ul>{mergeAffected.map((item) => <li key={item.id}>{matchLabel(state, item)}（{Math.round(item.score * 100)}%）</li>)}</ul>
+                </div>
+              )}
               <div class="field-picker-head"><span>字段</span><span>A 组来源</span><span>B 组来源</span></div>
               <div class="field-picker">
                 {fieldLabels.map(([field, label]) => {
