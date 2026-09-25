@@ -2,9 +2,58 @@ import {
   $, component$, useComputed$, useSignal, useStore, useVisibleTask$
 } from '@builder.io/qwik';
 import { Checkbox, Modal, Tabs } from '@qwik-ui/headless';
-import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup } from './types';
+import type { ArchiveRecord, ArchiveState, FieldKey, IgnoreReasonCode, ManualIgnoreReasonCode, MatchCandidate, RecordGroup } from './types';
+import { ignoreReasonLabel, MANUAL_IGNORE_REASONS } from './types';
 import { computeMatches, fieldValue, scorePair } from './utils/matching';
 import { seedState } from './data/seed';
+
+interface Displacement {
+  oldMatchId: string;
+  oldLabel: string;
+  sharedRecordIds: string[];
+}
+interface ConfirmStep {
+  matchId: string;
+  displacements: Displacement[];
+}
+
+const touchesRecord = (match: MatchCandidate, recordId: string) => match.leftId === recordId || match.rightId === recordId;
+
+/**
+ * 计算依次确认这些匹配的完整计划：每条记录在同一时刻只属于一条已确认匹配，
+ * 因此计划里先出现的匹配可能被后确认的匹配挤掉，已确认的存量匹配同理。
+ */
+const buildConfirmPlan = (state: ArchiveState, ids: string[]): ConfirmStep[] => {
+  const claimedBy = new Map<string, string>();
+  state.matches.forEach((match) => {
+    if (match.status === 'confirmed') {
+      claimedBy.set(match.leftId, match.id);
+      claimedBy.set(match.rightId, match.id);
+    }
+  });
+  const steps: ConfirmStep[] = [];
+  ids.forEach((id) => {
+    const match = state.matches.find((item) => item.id === id);
+    if (!match || match.status === 'confirmed' || match.status === 'merged') return;
+    const displacedIds = new Set<string>();
+    [match.leftId, match.rightId].forEach((recordId) => {
+      const holder = claimedBy.get(recordId);
+      if (holder && holder !== id) displacedIds.add(holder);
+    });
+    const displacements = [...displacedIds].map((oldMatchId) => {
+      const old = state.matches.find((item) => item.id === oldMatchId)!;
+      return {
+        oldMatchId,
+        oldLabel: matchLabel(state, old),
+        sharedRecordIds: [match.leftId, match.rightId].filter((recordId) => touchesRecord(old, recordId))
+      };
+    });
+    steps.push({ matchId: id, displacements });
+    claimedBy.set(match.leftId, id);
+    claimedBy.set(match.rightId, id);
+  });
+  return steps;
+};
 
 const STORAGE_KEY = 'sologsb-1020-archive-state-v1';
 const fieldLabels: Array<[FieldKey, string]> = [
@@ -41,6 +90,13 @@ export default component$(() => {
   const importText = useSignal('');
   const toast = useSignal('');
   const panelTab = useSignal(0);
+  const ignoreOpen = useSignal(false);
+  const ignoreBulk = useSignal(false);
+  const ignoreTargetId = useSignal('');
+  const ignoreReason = useSignal<ManualIgnoreReasonCode | ''>('');
+  const ignoreError = useSignal('');
+  const pendingConfirmSteps = useSignal<ConfirmStep[]>([]);
+  const supersedeOpen = useSignal(false);
 
   const snapshot = () => JSON.stringify({
     revision: state.revision,
@@ -108,35 +164,123 @@ export default component$(() => {
   const activeMatch = useComputed$(() => state.matches.find((match) => match.id === state.activeMatchId) ?? filteredMatches.value[0]);
   const conflictCount = useComputed$(() => state.matches.filter((match) => match.status === 'suggested' && match.score < .68).length);
 
-  const updateMatch = $((id: string, status: MatchCandidate['status']) => {
-    capture();
-    const match = state.matches.find((item) => item.id === id);
-    if (!match) return;
-    match.status = status;
-    match.reviewedAt = new Date().toISOString();
+  const refreshRecordStatuses = (affectedIds: string[]) => {
+    const ids = new Set(affectedIds);
     state.records.forEach((record) => {
-      if ((record.id === match.leftId || record.id === match.rightId) && status === 'confirmed') record.status = 'confirmed';
+      if (!ids.has(record.id)) return;
+      if (record.status === 'merged') return;
+      const live = state.matches.find((match) =>
+        match.status === 'confirmed' && touchesRecord(match, record.id) &&
+        state.records.some((item) => item.id === match.leftId) && state.records.some((item) => item.id === match.rightId));
+      record.status = live ? 'confirmed' : 'unreviewed';
     });
-    commit(status === 'confirmed' ? '确认匹配' : '忽略可疑匹配', matchLabel(state, match), [match.leftId, match.rightId]);
-    notify(status === 'confirmed' ? '已确认此项匹配' : '已忽略此项匹配');
+  };
+
+  const applyConfirms = $((steps: ConfirmStep[]) => {
+    if (!steps.length) return;
+    capture();
+    const nowIso = new Date().toISOString();
+    const affected = new Set<string>();
+    let count = 0;
+    steps.forEach((step) => {
+      const match = state.matches.find((item) => item.id === step.matchId);
+      if (!match) return;
+      match.status = 'confirmed';
+      match.reviewedAt = nowIso;
+      affected.add(match.leftId);
+      affected.add(match.rightId);
+      count += 1;
+      step.displacements.forEach((d) => {
+        const old = state.matches.find((item) => item.id === d.oldMatchId);
+        if (!old) return;
+        old.status = 'rejected';
+        old.ignoreReason = 'superseded';
+        old.supersededByMatchId = match.id;
+        old.reviewedAt = nowIso;
+        affected.add(old.leftId);
+        affected.add(old.rightId);
+        commit('匹配被挤掉', `确认「${matchLabel(state, match)}」后，原已确认匹配「${d.oldLabel}」被标记为已忽略（涉及记录 ${d.sharedRecordIds.map((id) => recordById(state, id)?.identifier || id).join('、')}）`, [old.leftId, old.rightId, match.leftId, match.rightId]);
+      });
+    });
+    refreshRecordStatuses([...affected]);
+    if (count > 1) commit('批量确认匹配', `${count} 条匹配被确认为同一档案`, [...affected]);
+    else {
+      const match = state.matches.find((item) => item.id === steps[0].matchId);
+      if (match) commit('确认匹配', matchLabel(state, match), [match.leftId, match.rightId]);
+    }
+    selectedMatchIds.value = [];
+    pendingConfirmSteps.value = [];
+    supersedeOpen.value = false;
+    notify(count > 1 ? `已确认 ${count} 条匹配，被挤掉的匹配已注明去向` : '已确认此项匹配');
   });
 
-  const bulkMatch = $((status: MatchCandidate['status']) => {
-    const ids = selectedMatchIds.value;
-    if (!ids.length) return;
+  const requestConfirm = $((ids: string[]) => {
+    const plan = buildConfirmPlan(state, ids).filter((step) =>
+      state.matches.some((match) => match.id === step.matchId && match.status !== 'confirmed' && match.status !== 'merged'));
+    if (!plan.length) {
+      notify('所选匹配都已确认');
+      return;
+    }
+    const displaced = plan.some((step) => step.displacements.length);
+    if (displaced) {
+      pendingConfirmSteps.value = plan;
+      supersedeOpen.value = true;
+      return;
+    }
+    applyConfirms(plan);
+  });
+
+  const openIgnore = $((id: string, bulk: boolean) => {
+    ignoreTargetId.value = id;
+    ignoreBulk.value = bulk;
+    if (!bulk) {
+      const match = state.matches.find((item) => item.id === id);
+      const reason = match?.ignoreReason;
+      ignoreReason.value = reason && reason !== 'superseded' && reason !== 'merged_away' ? reason : '';
+    } else ignoreReason.value = '';
+    ignoreError.value = '';
+    ignoreOpen.value = true;
+  });
+
+  const submitIgnore = $(() => {
+    const reason = ignoreReason.value;
+    if (!reason) {
+      ignoreError.value = '请先从固定原因中选择一个忽略原因；未选原因不能忽略。';
+      return;
+    }
+    const bulk = ignoreBulk.value;
+    const targets = bulk ? selectedMatchIds.value : [ignoreTargetId.value];
+    const nowIso = new Date().toISOString();
     capture();
-    ids.forEach((id) => {
+    const affected = new Set<string>();
+    let count = 0;
+    targets.forEach((id) => {
       const match = state.matches.find((item) => item.id === id);
-      if (!match) return;
-      match.status = status;
-      match.reviewedAt = new Date().toISOString();
+      if (!match || match.status === 'merged') return;
+      match.status = 'rejected';
+      match.ignoreReason = reason as IgnoreReasonCode;
+      match.supersededByMatchId = undefined;
+      match.reviewedAt = nowIso;
+      affected.add(match.leftId);
+      affected.add(match.rightId);
+      count += 1;
     });
-    commit('批量复核', `${ids.length} 条匹配被标记为${status === 'confirmed' ? '确认' : '忽略'}`, ids.flatMap((id) => {
-      const match = state.matches.find((item) => item.id === id);
-      return match ? [match.leftId, match.rightId] : [];
-    }));
+    if (!count) {
+      history.value = history.value.slice(0, -1);
+      notify('没有可忽略的匹配');
+      return;
+    }
+    refreshRecordStatuses([...affected]);
+    if (bulk) commit('批量忽略匹配', `${count} 条匹配被标记为已忽略，统一原因：${ignoreReasonLabel(reason)}`, [...affected]);
+    else {
+      const match = state.matches.find((item) => item.id === ignoreTargetId.value);
+      if (match) commit('忽略可疑匹配', `${matchLabel(state, match)}｜原因：${ignoreReasonLabel(reason)}`, [match.leftId, match.rightId]);
+    }
     selectedMatchIds.value = [];
-    notify(`已批量处理 ${ids.length} 条匹配`);
+    ignoreOpen.value = false;
+    ignoreReason.value = '';
+    ignoreError.value = '';
+    notify(bulk ? `已按「${ignoreReasonLabel(reason)}」忽略 ${count} 条匹配` : `已忽略，原因：${ignoreReasonLabel(reason)}`);
   });
 
   const openMerge = $(() => {
@@ -169,19 +313,31 @@ export default component$(() => {
       const pick = source === 'combine' ? `${fieldValue(left, field)}；${fieldValue(right, field)}` : fieldValue(source === 'A' ? left : right, field);
       values[field] = pick;
     });
+    const nowIso = new Date().toISOString();
     const merged: ArchiveRecord = {
       ...left,
       ...values,
       people: values.people?.split(/[；、,，]/).map((item) => item.trim()).filter(Boolean) ?? left.people,
       places: values.places?.split(/[；、,，]/).map((item) => item.trim()).filter(Boolean) ?? left.places,
       status: 'merged',
-      updatedAt: new Date().toISOString()
+      updatedAt: nowIso
     };
+    const pairLabel = matchLabel(state, match);
     state.records = [...state.records.filter((record) => record.id !== left.id && record.id !== right.id), merged];
+    const affected = new Set<string>();
     state.matches.forEach((item) => {
       if (item.id === match.id) item.status = 'merged';
-      else if (item.leftId === left.id || item.rightId === right.id || item.leftId === right.id || item.rightId === left.id) item.status = 'rejected';
+      else if (touchesRecord(item, left.id) || touchesRecord(item, right.id)) {
+        item.status = 'rejected';
+        item.ignoreReason = 'merged_away';
+        item.supersededByMatchId = match.id;
+        item.reviewedAt = nowIso;
+        affected.add(item.leftId);
+        affected.add(item.rightId);
+        commit('匹配因合并失效', `「${matchLabel(state, item)}」涉及的记录已在「${pairLabel}」中合并，本条标记为已忽略`, [item.leftId, item.rightId, merged.id]);
+      }
     });
+    refreshRecordStatuses([...affected]);
     state.merges.unshift({
       id: crypto.randomUUID(),
       matchId: match.id,
@@ -189,7 +345,7 @@ export default component$(() => {
       rightId: right.id,
       chosen: { ...choices },
       values,
-      mergedAt: new Date().toISOString()
+      mergedAt: nowIso
     });
     commit('合并两条记录', `保留 ${Object.values(choices).filter((choice) => choice === 'A').length} 个 A 来源字段、${Object.values(choices).filter((choice) => choice === 'B').length} 个 B 来源字段`, [left.id, right.id, merged.id]);
     mergeOpen.value = false;
@@ -309,11 +465,12 @@ export default component$(() => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'i') { event.preventDefault(); importOpen.value = true; return; }
       if (editing) return;
       const key = event.key.toLowerCase();
+      if (importOpen.value || mergeOpen.value || ignoreOpen.value || supersedeOpen.value) return;
       if (key === 'j') { event.preventDefault(); moveReview(1); }
       if (key === 'k') { event.preventDefault(); moveReview(-1); }
       if (event.key === 'Enter' && activeMatch.value) { event.preventDefault(); openMerge(); }
-      if (key === 'c' && activeMatch.value) { event.preventDefault(); updateMatch(activeMatch.value.id, 'confirmed'); }
-      if (key === 'r' && activeMatch.value) { event.preventDefault(); updateMatch(activeMatch.value.id, 'rejected'); }
+      if (key === 'c' && activeMatch.value) { event.preventDefault(); requestConfirm([activeMatch.value.id]); }
+      if (key === 'r' && activeMatch.value) { event.preventDefault(); openIgnore(activeMatch.value.id, false); }
       if (key === '?' || (event.shiftKey && event.key === '/')) { event.preventDefault(); panelTab.value = 2; }
     };
     window.addEventListener('keydown', handler);
@@ -356,8 +513,8 @@ export default component$(() => {
             <select class="input" value={statusFilter.value} onChange$={(event) => { statusFilter.value = (event.target as HTMLSelectElement).value as typeof statusFilter.value; }}>
               <option value="all">全部匹配</option><option value="suggested">待复核</option><option value="confirmed">已确认</option><option value="rejected">已忽略</option>
             </select>
-            <button class="button small" disabled={!selectedMatchIds.value.length} onClick$={() => bulkMatch('confirmed')}>批量确认</button>
-            <button class="button small ghost" disabled={!selectedMatchIds.value.length} onClick$={() => bulkMatch('rejected')}>批量忽略</button>
+            <button class="button small" disabled={!selectedMatchIds.value.length} onClick$={() => requestConfirm(selectedMatchIds.value)}>批量确认</button>
+            <button class="button small ghost" disabled={!selectedMatchIds.value.length} onClick$={() => openIgnore('', true)}>批量忽略</button>
           </div>
           <div class="match-list">
             {visibleMatches.value.map((match) => {
@@ -392,7 +549,11 @@ export default component$(() => {
                     <i>↔</i>
                     <div><small>B · {right?.group}</small><strong>{right?.title}</strong><span>{parseDate(right?.date ?? '')} · {right?.people.join('、')}</span></div>
                   </div>
-                  <div class="reason-line">{match.reasons.join(' · ')}</div>
+                  <div class="reason-line">
+                    {match.status === 'rejected'
+                      ? `已忽略 · ${ignoreReasonLabel(match.ignoreReason)}${match.supersededByMatchId ? ` · 由匹配 ${match.supersededByMatchId} 挤掉` : ''}`
+                      : match.reasons.join(' · ')}
+                  </div>
                 </article>
               );
             })}
@@ -438,7 +599,16 @@ export default component$(() => {
                   <div class="field-compare compact"><div class="field-label">字段</div><div>A 来源</div><div>B 来源</div>
                     {fieldLabels.map(([field, label]) => <><div class="field-label">{label}</div><div class={fieldValue(left, field) !== fieldValue(right, field) ? 'different' : ''}>{fieldValue(left, field) || '—'}</div><div class={fieldValue(left, field) !== fieldValue(right, field) ? 'different' : ''}>{fieldValue(right, field) || '—'}</div></>)}
                   </div>
-                  <div class="action-stack"><button class="button primary wide" onClick$={openMerge}>逐字段合并</button><div class="split-actions"><button class="button confirm" onClick$={() => updateMatch(activeMatch.value!.id, 'confirmed')}>确认匹配</button><button class="button ghost" onClick$={() => updateMatch(activeMatch.value!.id, 'rejected')}>忽略</button></div></div>
+                  {activeMatch.value!.status === 'rejected' && (
+                    <div class="ignore-note">
+                      <strong>忽略原因：{ignoreReasonLabel(activeMatch.value!.ignoreReason)}</strong>
+                      {activeMatch.value!.supersededByMatchId && (() => {
+                        const blocker = state.matches.find((item) => item.id === activeMatch.value!.supersededByMatchId);
+                        return <small>{blocker ? `后确认的「${matchLabel(state, blocker)}」挤掉了本匹配。` : `被匹配 ${activeMatch.value!.supersededByMatchId} 挤掉。`}</small>;
+                      })()}
+                    </div>
+                  )}
+                  <div class="action-stack"><button class="button primary wide" onClick$={openMerge}>逐字段合并</button><div class="split-actions"><button class="button confirm" onClick$={() => requestConfirm([activeMatch.value!.id])}>确认匹配</button><button class="button ghost" onClick$={() => openIgnore(activeMatch.value!.id, false)}>忽略</button></div></div>
                 </>;
               })() : <div class="empty-state">从左侧选择一条匹配查看字段来源。</div>}
             </Tabs.Panel>
@@ -450,7 +620,7 @@ export default component$(() => {
               }) : <div class="empty-state">还没有合并记录。完成一次字段合并后，来源选择会出现在这里。</div>}
             </Tabs.Panel>
             <Tabs.Panel class="tab-panel shortcut-panel">
-              <div><kbd>J / K</kbd><span>下一条 / 上一条可疑匹配</span></div><div><kbd>Enter</kbd><span>打开逐字段合并窗口</span></div><div><kbd>C / R</kbd><span>确认 / 忽略当前匹配</span></div><div><kbd>Ctrl + Z / Y</kbd><span>撤销 / 重做</span></div><div><kbd>Ctrl + I</kbd><span>打开导入窗口</span></div><div><kbd>Ctrl/⌘ + Enter</kbd><span>在导入框中提交记录</span></div>
+              <div><kbd>J / K</kbd><span>下一条 / 上一条可疑匹配</span></div><div><kbd>Enter</kbd><span>打开逐字段合并窗口</span></div><div><kbd>C / R</kbd><span>确认匹配 / 打开忽略原因选择（必须挑选原因）</span></div><div><kbd>Ctrl + Z / Y</kbd><span>撤销 / 重做</span></div><div><kbd>Ctrl + I</kbd><span>打开导入窗口</span></div><div><kbd>Ctrl/⌘ + Enter</kbd><span>在导入框中提交记录</span></div>
             </Tabs.Panel>
           </Tabs.Root>
         </section>
@@ -467,7 +637,7 @@ export default component$(() => {
           <div class="panel-heading"><div><span class="eyebrow">METHOD</span><h3>匹配与保护规则</h3></div></div>
           <p>标题、日期、人物、地点和编号按权重综合评分。低于 68% 的候选会以红色标记，但系统不会替研究者自动决定。</p>
           <div class="rule-row"><span>1</span><p>每个字段保留 A / B 来源，可在合并窗口中单独选择或拼接。</p></div>
-          <div class="rule-row"><span>2</span><p>原始记录、合并结果和忽略理由都进入本地审计轨迹。</p></div>
+          <div class="rule-row"><span>2</span><p>忽略必须从固定原因中挑选；同一记录改确认到另一条匹配时，原匹配会注明被谁挤掉。</p></div>
           <div class="rule-row"><span>3</span><p>记录列表使用分批窗口渲染，导入大量数据时仍只挂载当前窗口。</p></div>
         </article>
       </section>
@@ -509,6 +679,57 @@ export default component$(() => {
               <Modal.Footer class="modal-footer"><Modal.Close class="button ghost">取消</Modal.Close><button class="button primary" onClick$={mergeCurrent}>生成合并记录</button></Modal.Footer>
             </>;
           })()}
+        </Modal.Panel>
+      </Modal.Root>
+
+      <Modal.Root bind:show={ignoreOpen} closeOnBackdropClick>
+        <Modal.Panel class="modal-panel reason-modal">
+          <Modal.Header class="modal-header"><div><span class="eyebrow">IGNORE REASON</span><Modal.Title>{ignoreBulk.value ? `批量忽略 ${selectedMatchIds.value.length} 条匹配` : '忽略此匹配'}</Modal.Title></div><Modal.Close class="modal-close">×</Modal.Close></Modal.Header>
+          <Modal.Description class="modal-description">忽略必须从固定原因中挑选一个，原因会随匹配与审计轨迹一起保存，事后可查。{ignoreBulk.value ? '所选匹配将统一使用该原因。' : ''}</Modal.Description>
+          <div class="reason-list">
+            {MANUAL_IGNORE_REASONS.map((option) => (
+              <label class={`reason-card ${ignoreReason.value === option.code ? 'selected' : ''}`} key={option.code}>
+                <input
+                  type="radio"
+                  name="ignore-reason"
+                  checked={ignoreReason.value === option.code}
+                  onChange$={() => { ignoreReason.value = option.code; ignoreError.value = ''; }}
+                />
+                <span><strong>{option.label}</strong><small>{option.hint}</small></span>
+              </label>
+            ))}
+          </div>
+          {ignoreError.value && <div class="form-error">⚠ {ignoreError.value}</div>}
+          <Modal.Footer class="modal-footer"><Modal.Close class="button ghost">取消</Modal.Close><button class="button danger" onClick$={submitIgnore}>确认忽略</button></Modal.Footer>
+        </Modal.Panel>
+      </Modal.Root>
+
+      <Modal.Root bind:show={supersedeOpen} closeOnBackdropClick
+        onClose$={() => { pendingConfirmSteps.value = []; }}
+      >
+        <Modal.Panel class="modal-panel supersede-modal">
+          <Modal.Header class="modal-header"><div><span class="eyebrow">CONFLICTING CONFIRMATION</span><Modal.Title>已有确认匹配会被挤掉</Modal.Title></div><Modal.Close class="modal-close" onClick$={() => { pendingConfirmSteps.value = []; }}>×</Modal.Close></Modal.Header>
+          <Modal.Description class="modal-description">以下记录已经在另一条匹配中被确认。继续确认后，旧匹配将标记为「已忽略 · 被后确认的匹配挤掉」，并记录是哪条新匹配挤掉它；此操作可撤销。</Modal.Description>
+          <div class="supersede-list">
+            {pendingConfirmSteps.value.filter((step) => step.displacements.length).map((step) => {
+              const incoming = state.matches.find((item) => item.id === step.matchId);
+              return (
+                <div class="supersede-group" key={step.matchId}>
+                  <div class="supersede-incoming">新确认：{incoming ? matchLabel(state, incoming) : step.matchId}</div>
+                  {step.displacements.map((d) => (
+                    <div class="supersede-item" key={`${step.matchId}-${d.oldMatchId}`}>
+                      <span class="arrow-badge">挤掉</span>
+                      <div><strong>{d.oldLabel}</strong><small>共享记录：{d.sharedRecordIds.map((id) => recordById(state, id)?.identifier || id).join('、') || '（记录已合并）'}</small></div>
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+          <Modal.Footer class="modal-footer">
+            <button class="button ghost" onClick$={() => { supersedeOpen.value = false; pendingConfirmSteps.value = []; }}>取消</button>
+            <button class="button primary" onClick$={() => applyConfirms(pendingConfirmSteps.value)}>继续确认并忽略旧匹配</button>
+          </Modal.Footer>
         </Modal.Panel>
       </Modal.Root>
     </div>

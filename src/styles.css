@@ -152,4 +152,25 @@ kbd { justify-self: start; padding: 3px 6px; border: 1px solid #c8d2d5; border-b
 .combine-button.selected { color: white; border-color: #9b7244; background: #9b7244; }
 .qwik-check { display: grid; place-items: center; width: 17px; height: 17px; border: 1px solid #b9c8cc; border-radius: 4px; background: white; cursor: pointer; }
 .qwik-check[aria-checked="true"] { color: white; border-color: #3d7c89; background: #3d7c89; }
+.reason-modal { width: min(620px, calc(100vw - 32px)); }
+.supersede-modal { width: min(680px, calc(100vw - 32px)); }
+.reason-list { display: grid; gap: 8px; padding: 0 20px; }
+.reason-card { display: flex; align-items: flex-start; gap: 9px; padding: 10px 12px; border: 1px solid #d5dfe1; border-radius: 8px; cursor: pointer; transition: .15s ease; }
+.reason-card:hover { border-color: #9fb8bd; background: #f6fafa; }
+.reason-card.selected { border-color: #b64d3d; background: #fbf3f1; box-shadow: inset 3px 0 0 var(--red); }
+.reason-card input { margin-top: 2px; accent-color: var(--red); }
+.reason-card span { display: flex; flex-direction: column; gap: 3px; }
+.reason-card strong { font-size: 11px; color: #2b424c; }
+.reason-card small { color: var(--muted); font-size: 9px; line-height: 1.55; }
+.form-error { margin: 10px 20px 0; padding: 9px 11px; color: var(--red); border: 1px solid #e3c2bb; border-radius: 8px; background: #fbf0ee; font-size: 10px; }
+.ignore-note { margin-top: 11px; padding: 10px 12px; border: 1px solid #e2c9c3; border-radius: 8px; background: #fbf3f1; }
+.ignore-note strong { display: block; color: #8d4938; font-size: 10px; }
+.ignore-note small { display: block; margin-top: 3px; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.supersede-list { display: grid; gap: 10px; padding: 0 20px; max-height: 52vh; overflow: auto; }
+.supersede-group { border: 1px solid #e0e7e9; border-radius: 9px; overflow: hidden; }
+.supersede-incoming { padding: 9px 12px; color: #22513f; background: #e7f3ec; font-size: 10px; font-weight: 700; line-height: 1.5; }
+.supersede-item { display: flex; align-items: center; gap: 9px; padding: 10px 12px; border-top: 1px solid #e8eded; }
+.supersede-item strong { display: block; font-size: 10px; color: #2b424c; line-height: 1.5; }
+.supersede-item small { display: block; margin-top: 2px; color: var(--muted); font-size: 9px; }
+.arrow-badge { flex: 0 0 auto; padding: 3px 7px; color: white; border-radius: 5px; background: var(--red); font-size: 8px; font-weight: 800; letter-spacing: .08em; }
 @media (max-width: 1330px) { .desk-grid { grid-template-columns: minmax(330px, 1fr) minmax(380px, 1.15fr) minmax(300px, .85fr); gap: 10px; padding: 0 12px; } .overview, .bottom-grid { padding-left: 12px; padding-right: 12px; } .metrics { gap: 14px; } }

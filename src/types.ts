@@ -27,7 +27,40 @@ export interface MatchCandidate {
   status: MatchStatus;
   reasons: string[];
   reviewedAt?: string;
+  ignoreReason?: IgnoreReasonCode;
+  supersededByMatchId?: string;
 }
+
+export const MANUAL_IGNORE_REASON_CODES = [
+  'not_same_record',
+  'different_entity',
+  'conflicting_metadata',
+  'duplicate_resolved',
+  'low_score'
+] as const;
+export type ManualIgnoreReasonCode = (typeof MANUAL_IGNORE_REASON_CODES)[number];
+export type IgnoreReasonCode = ManualIgnoreReasonCode | 'superseded' | 'merged_away';
+
+export const MANUAL_IGNORE_REASONS: ReadonlyArray<{ code: ManualIgnoreReasonCode; label: string; hint: string }> = [
+  { code: 'not_same_record', label: '并非同一档案', hint: '两条记录描述的不是同一件档案，只是标题或信息相近' },
+  { code: 'different_entity', label: '相关人物或机构不同', hint: '名称相近，但指向不同的人、家族或机构' },
+  { code: 'conflicting_metadata', label: '关键元数据冲突', hint: '日期、编号、载体等关键字段互相矛盾' },
+  { code: 'duplicate_resolved', label: '已由另一条匹配处理', hint: '记录已在其他匹配中确认，本条属于重复配对' },
+  { code: 'low_score', label: '相似度不足，系统误配', hint: '综合比对得分不足以支持同一档案判断' }
+];
+
+export const IGNORE_REASON_LABELS: Record<IgnoreReasonCode, string> = {
+  not_same_record: '并非同一档案',
+  different_entity: '相关人物或机构不同',
+  conflicting_metadata: '关键元数据冲突',
+  duplicate_resolved: '已由另一条匹配处理',
+  low_score: '相似度不足，系统误配',
+  superseded: '被后确认的匹配挤掉',
+  merged_away: '因相关记录已合并而失效'
+};
+
+export const ignoreReasonLabel = (code: string | undefined): string =>
+  code ? (IGNORE_REASON_LABELS as Record<string, string>)[code] ?? code : '未记录原因（旧版进度）';
 
 export interface MergeResult {
   id: string;
